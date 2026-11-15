@@ -245,6 +245,11 @@ function renderSite(id, site, viewTime, alerts) {
     progress.setAttribute("aria-label", label + " 목표 달성률 " + rateText);
   }
 
+  renderPhoto(
+    document.querySelector("#" + id + "-photo"),
+    id === "factory" ? "공장 생산 참고 사진" : "창고 출고 참고 사진",
+    site
+  );
   renderGraph(id, label, site.history);
 
   const age = freshness(site.lastEventAt, viewTime);
@@ -266,6 +271,38 @@ function renderSite(id, site, viewTime, alerts) {
       : "전송 기록을 확인할 수 없습니다.";
   alertsCard.querySelector(".card-description").textContent = alertDescription;
   alertsCard.querySelector(".meta").textContent = "마지막 전송 시도: " + dateText(alerts.lastAttemptAt);
+}
+
+function renderPhoto(slot, caption, site) {
+  const image = site.image;
+  const key = image ? image.url + "\n" + image.alt : "none";
+  if (slot.dataset.photo === key) return;
+  slot.dataset.photo = key;
+
+  if (!image) {
+    const placeholder = document.createElement("div");
+    placeholder.className = "photo-placeholder";
+    placeholder.textContent = "현장 사진 없음";
+    const description = document.createElement("figcaption");
+    description.textContent = caption;
+    slot.replaceChildren(placeholder, description);
+    return;
+  }
+
+  const img = document.createElement("img");
+  img.src = image.url;
+  img.alt = image.alt.trim() || caption;
+  img.loading = "lazy";
+  img.onerror = () => {
+    img.remove();
+    const placeholder = document.createElement("div");
+    placeholder.className = "photo-placeholder";
+    placeholder.textContent = "현장 사진을 불러오지 못했습니다.";
+    slot.prepend(placeholder);
+  };
+  const description = document.createElement("figcaption");
+  description.textContent = caption;
+  slot.replaceChildren(img, description);
 }
 
 function renderFlow(id, site, label, status, age) {
