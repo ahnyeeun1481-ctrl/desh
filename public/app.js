@@ -1,8 +1,9 @@
-const snapshot = window.SAMPLE_SNAPSHOT;
 const config = window.DASHBOARD_CONFIG || {};
 let lastData = null;
 let lastSuccessAt = null;
 let errorText = "";
+let selectedAt = "";
+let viewGeneration = 0;
 const HOUR = 60 * 60 * 1000;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const dateFormat = new Intl.DateTimeFormat("ko-KR", {
@@ -40,7 +41,18 @@ function renderQueryStatus() {
   updatedAt.textContent = lastSuccessAt
     ? "마지막 조회 성공: " + dateText(lastSuccessAt)
     : "조회 성공 기록이 없습니다.";
-  viewContext.textContent = "현재 시각 기준";
+  viewContext.replaceChildren();
+  viewContext.append(document.createTextNode(selectedAt
+    ? dateText(selectedAt) + " 기준 · 과거 자료"
+    : "현재 시각 기준"));
+  if (selectedAt) {
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "inline-button";
+    back.textContent = "현재로 돌아가기";
+    back.addEventListener("click", () => changeView(""));
+    viewContext.append(back);
+  }
   document.querySelector("#data-errors").hidden = true;
 }
 
@@ -95,19 +107,104 @@ async function requestJson(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, {
-      method: "GET",
-      cache: "no-store",
-      headers: { Accept: "application/json" },
-      signal: controller.signal
-    });
-    if (!response.ok) throw new Error("HTTP " + response.status);
-    const body = await response.json();
-    if (body && typeof body.error === "string") throw new Error(body.error);
+    let response;
+    try {
+      response = await fetch(url, {
+        method: "GET",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+        signal: controller.signal
+      });
+    } catch {
+      if (controller.signal.aborted) {
+        const seconds = String(Math.round(timeoutMs / 100) / 10);
+        throw new Error("서버가 " + seconds + "초 안에 응답하지 않았습니다. 잠시 후 다시 조회하고, 계속되면 서버를 실행한 창의 기록(로그)을 확인하거나 강사에게 알려 주세요.");
+      }
+      throw new Error("API 서버에 연결하지 못했습니다. 연결 주소가 맞는지, 직접 띄운 서버라면 켜져 있는지 확인해 주세요. GAS 웹 앱이라면 편집기에서 함수를 한 번 실행해 권한을 승인했는지도 확인해 주세요.");
+    }
+    if (!response.ok) throw new Error(httpErrorMessage(response.status));
+    let body;
+    try {
+      body = await response.json();
+    } catch {
+      if (controller.signal.aborted) {
+        const seconds = String(Math.round(timeoutMs / 100) / 10);
+        throw new Error("서버가 " + seconds + "초 안에 응답하지 않았습니다. 잠시 후 다시 조회하고, 계속되면 서버를 실행한 창의 기록(로그)을 확인하거나 강사에게 알려 주세요.");
+      }
+      throw new Error("서버 응답이 JSON 형식이 아닙니다. 연결 주소가 API 서버 주소인지 확인해 주세요.");
+    }
+    if (body && typeof body.error === "string") throw new Error(serverReasonMessage(body.error));
     return body;
   } finally {
     clearTimeout(timer);
   }
+}
+
+const RETRY_HINT = "잠시 후 다시 조회하고, 계속되면 서버를 실행한 창의 기록(로그)을 확인하거나 강사에게 알려 주세요.";
+
+function httpErrorMessage(status) {
+  if (status === 400) return "서버가 요청 조건을 받아들이지 않았습니다(HTTP 400).";
+  if (status === 404) return "서버에 요청한 주소가 없습니다(HTTP 404). 연결 주소를 확인해 주세요.";
+  if (status >= 500) return "서버가 요청을 처리하지 못했습니다(HTTP " + status + "). " + RETRY_HINT;
+  return "서버가 요청을 거절했습니다(HTTP " + status + ").";
+}
+
+function serverReasonMessage(reason) {
+  return "서버가 요청을 처리하지 못했습니다. 서버가 알린 이유: " + reason;
+}
+
+const TIME_TEXT = "시각 문자열(예: 2026-10-15T09:00:00+09:00)";
+const fieldError = (lead, path, expected) => lead + " 틀린 항목: " + path + " (기대: " + expected + ")";
+const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value);
+
+function validateSnapshot(data) {
+  const base = (path, expected) => fieldError("서버 자료의 기본 형식을 확인해 주세요.", path, expected);
+  if (!isObject(data)) return base("(응답 전체)", "JSON 객체");
+  if (data.schemaVersion !== 1) return base("schemaVersion", "숫자 1");
+  if (!integer(data.revision) || data.revision < 1) return base("revision", "1 이상의 정수");
+  if (typeof data.scenarioId !== "string") return base("scenarioId", "문자열");
+  if (!validTime(data.changedAt)) return base("changedAt", TIME_TEXT);
+  if (!validTime(data.serverTime)) return base("serverTime", TIME_TEXT);
+  if (data.trainingOnly !== true) return base("trainingOnly", "true");
+  if (!isObject(data.sites)) return base("sites", "객체");
+  if (!isObject(data.services)) return base("services", "객체");
+  if (!Array.isArray(data.incidents)) return base("incidents", "배열");
+
+  const serviceError = (path, expected) => fieldError("서비스 상태의 형식을 확인해 주세요.", path, expected);
+  if (data.incidents.length > 0) {
+    const incident = data.incidents[0];
+    const path = "incidents[0]";
+    if (!isObject(incident)) return serviceError(path, "객체");
+    if (typeof incident.id !== "string") return serviceError(path + ".id", "문자열");
+    if (!["warning", "error"].includes(incident.level)) return serviceError(path + ".level", "\"warning\" 또는 \"error\"");
+    const missing = ["title", "owner", "action"].find(key => typeof incident[key] !== "string");
+    if (missing) return serviceError(path + "." + missing, "문자열");
+  }
+
+  if (data.viewTime !== undefined && (!validTime(data.viewTime) || Date.parse(data.viewTime) > Date.parse(data.serverTime))) {
+    return fieldError("조회 기준 시각을 확인해 주세요.", "viewTime", "serverTime 이전이거나 같은 " + TIME_TEXT);
+  }
+  return null;
+}
+
+function validateRecords(data, at) {
+  const lead = "기록 응답 형식이 올바르지 않습니다.";
+  if (!isObject(data)) return fieldError(lead, "(응답 전체)", "JSON 객체");
+  if (!Array.isArray(data.records)) return fieldError(lead, "records", "배열");
+  const limit = Date.parse(at);
+  const before = "기준 시각 이전이거나 같은 " + TIME_TEXT;
+  for (const [index, record] of data.records.entries()) {
+    const path = "records[" + index + "]";
+    if (!isObject(record)) return fieldError(lead, path, "객체");
+    if (!integer(record.quantity)) return fieldError(lead, path + ".quantity", "0 이상의 정수");
+    if (!validTime(record.occurredAt) || Date.parse(record.occurredAt) > limit) return fieldError(lead, path + ".occurredAt", before);
+    for (const key of ["receivedAt", "processedAt"]) {
+      if (record[key] !== null && (!validTime(record[key]) || Date.parse(record[key]) > limit)) {
+        return fieldError(lead, path + "." + key, "null 또는 " + before);
+      }
+    }
+  }
+  return null;
 }
 
 function normalizeSnapshot(data) {
@@ -178,11 +275,17 @@ function emptySnapshot() {
   };
 }
 
-async function readSnapshot() {
+async function readSnapshot(at = "") {
   if (typeof config.apiBaseUrl !== "string" || !/^https?:\/\//.test(config.apiBaseUrl)) {
     throw new Error("API 연결 주소가 설정되지 않았습니다.");
   }
-  const response = await requestJson(apiUrl(config.apiBaseUrl, "/api/v1/snapshot"));
+  const params = at ? new URLSearchParams({ at: new Date(at).toISOString() }) : "";
+  const response = await requestJson(apiUrl(config.apiBaseUrl, "/api/v1/snapshot", params));
+  const problem = validateSnapshot(response);
+  if (problem) throw new Error(problem);
+  if (at && (!validTime(response.viewTime) || Date.parse(response.viewTime) !== Date.parse(at))) {
+    throw new Error("요청한 기준 시각과 서버 자료의 시각이 다릅니다.");
+  }
   return normalizeSnapshot(response);
 }
 
@@ -342,15 +445,26 @@ function renderFlow(id, site, label, status, age) {
   card.replaceChildren(...content);
 }
 
-function currentIssues(data) {
+function currentIssues(data, failure = "") {
   const unique = new Map();
   for (const item of data?.incidents || []) {
     if (item.id !== "PREDICTION-JOB" && !unique.has(item.id)) {
       unique.set(item.id, item);
     }
   }
+  if (failure) {
+    unique.set("API-QUERY", {
+      id: "API-QUERY",
+      scope: "service",
+      level: "error",
+      title: "최신 자료를 가져오지 못했습니다.",
+      owner: "서비스 운영 담당자",
+      action: "조회 연결과 서버 상태를 확인해 주세요."
+    });
+  }
   return [...unique.values()].sort((a, b) => {
-    return (a.level === "error" ? 0 : 1) - (b.level === "error" ? 0 : 1);
+    const rank = item => item.id === "API-QUERY" ? 0 : item.level === "error" ? 1 : 2;
+    return rank(a) - rank(b);
   });
 }
 
@@ -421,6 +535,8 @@ function renderHero(issues) {
     guidance = "출고 기록 보기에서 마지막 기록을 확인하세요. ";
   } else if (first.id === "ALERT-DELIVERY") {
     guidance = "아래 알림 전송 기록에서 마지막 시도와 실패 여부를 확인하세요. ";
+  } else if (first.id === "API-QUERY") {
+    guidance = "새로고침 후에도 실패하면 담당자에게 문의하세요. ";
   }
 
   title.textContent = first.title;
@@ -575,6 +691,14 @@ function createRecordTable(headers, rows) {
   return wrapper;
 }
 
+function checkRecordRange() {
+  const from = document.querySelector("#record-from");
+  const to = document.querySelector("#record-to");
+  const fromTime = Date.parse(from.value + "+09:00");
+  const toTime = Date.parse(to.value + "+09:00");
+  to.setCustomValidity(toTime < fromTime ? "끝 시각은 시작 시각과 같거나 늦어야 합니다." : "");
+}
+
 function keepScroll(container, draw, sameScreen) {
   const before = !sameScreen ? [] : [".table-scroll", ".history-strip"].map(selector => {
     const old = container.querySelector(selector);
@@ -596,6 +720,10 @@ let recordTo = "";
 let recordsView = "";
 let renderedRecordsHash = null;
 let renderedHash = null;
+let recordsData = null;
+let recordsError = "";
+let recordsLoading = false;
+let recordsRequestKey = "";
 
 function renderRecords(data, id, sameScreen) {
   const from = document.querySelector("#record-from");
@@ -604,49 +732,174 @@ function renderRecords(data, id, sameScreen) {
   const end = localDateTime(data.viewTime);
   from.min = to.min = day + "T00:00:00";
   from.max = to.max = end;
-  from.value = recordFrom || day + "T00:00:00";
-  to.value = recordTo || end;
+  if (document.activeElement !== from) from.value = day + "T00:00:00";
+  if (document.activeElement !== to) to.value = end;
+  checkRecordRange();
 
-  const kind = id === "factory" ? "production" : "shipment";
-  const startTime = fromLocal(from.value);
-  const endTime = fromLocal(to.value);
-  const validRange = Number.isFinite(startTime) && Number.isFinite(endTime) && startTime <= endTime;
-  const records = validRange ? window.SAMPLE_RECORDS[kind].filter(record => {
-    const occurred = Date.parse(record.occurredAt);
-    return occurred >= startTime && occurred <= endTime;
-  }) : [];
-  const rows = records.map(record => [
+  const rows = recordsData && Array.isArray(recordsData.records) ? recordsData.records.map(record => [
     dateText(record.occurredAt),
     numberText(record.quantity) + "개",
     validTime(record.receivedAt) ? dateText(record.receivedAt) : "접수 대기",
     validTime(record.processedAt) ? dateText(record.processedAt) : "처리 대기",
     recordStatus(record.status)
-  ]);
+  ]) : null;
   const result = document.querySelector("#records-result");
-  const key = JSON.stringify(rows);
+  const key = JSON.stringify([recordsError, rows ?? recordsLoading]);
   if (recordsView === key) {
     renderedRecordsHash = location.hash;
     return;
   }
-
   recordsView = key;
-  keepScroll(result, () => result.replaceChildren(rows.length
-    ? createRecordTable(["발생 시각", "수량", "서버 접수", "서버 처리", "상태"], rows)
-    : Object.assign(document.createElement("p"), {
-      className: "notice",
-      textContent: "선택한 시간대에 기록이 없습니다."
-    })), sameScreen && renderedRecordsHash === location.hash);
+  keepScroll(result, () => {
+    if (recordsError) {
+      const notice = document.createElement("p");
+      notice.className = "notice warning";
+      notice.textContent = recordsError;
+      result.replaceChildren(notice);
+    } else if (!rows) {
+      const notice = document.createElement("p");
+      notice.className = "notice";
+      notice.textContent = "기록을 확인하고 있습니다.";
+      result.replaceChildren(notice);
+    } else if (rows.length > 0) {
+      result.replaceChildren(createRecordTable(["발생 시각", "수량", "서버 접수", "서버 처리", "상태"], rows));
+    } else {
+      const notice = document.createElement("p");
+      notice.className = "notice";
+      notice.textContent = "선택한 시간대에 기록이 없습니다.";
+      result.replaceChildren(notice);
+    }
+  }, sameScreen && renderedRecordsHash === location.hash);
   renderedRecordsHash = location.hash;
+}
+
+function queryStatusHistory(id) {
+  const card = document.createElement("section");
+  card.className = "card query-history";
+  card.setAttribute("aria-label", "조회 상태 이력");
+  const label = record => !record.ok ? "조회 실패" : record.available[id] ? "자료 제공" : "현장 값 누락";
+  const tone = record => !record.ok ? "danger" : record.available[id] ? "good" : "warning";
+  const latest = queryLog[queryLog.length - 1];
+  const top = document.createElement("div");
+  top.className = "status-line";
+  const title = document.createElement("h2");
+  title.textContent = id === "factory" ? "생산 데이터 조회" : "출고 데이터 조회";
+  const status = document.createElement("span");
+  status.className = "history-status " + (latest ? tone(latest) : "neutral");
+  status.textContent = latest ? label(latest) : "조회 기록 없음";
+  top.append(title, status);
+  card.append(top);
+
+  if (!latest) {
+    const empty = document.createElement("p");
+    empty.className = "notice";
+    empty.textContent = "아직 조회 기록이 없습니다.";
+    card.append(empty);
+    return card;
+  }
+
+  const strip = document.createElement("div");
+  strip.className = "history-strip";
+  strip.setAttribute("aria-label", "조회별 상태. 오래된 기록부터 최신 기록 순서입니다.");
+  const detail = document.createElement("p");
+  detail.className = "meta history-detail";
+  detail.setAttribute("role", "status");
+  detail.textContent = "막대 하나가 조회 한 번입니다. 막대를 선택하면 시각과 결과를 확인할 수 있습니다.";
+  for (const record of queryLog) {
+    const context = record.at ? dateText(record.at) : "현재";
+    const description = dateText(record.requestedAt) + " · " + label(record) + " · " + record.durationMs + "ms · 기준 시각: " + context;
+    const bar = document.createElement("button");
+    bar.type = "button";
+    bar.className = "history-bar " + tone(record);
+    bar.title = description;
+    bar.setAttribute("aria-label", description);
+    bar.dataset.at = record.requestedAt;
+    const choose = () => {
+      queryPick = record.requestedAt;
+      detail.textContent = description;
+    };
+    bar.addEventListener("click", choose);
+    bar.addEventListener("focus", choose);
+    if (record.requestedAt === queryPick) detail.textContent = description;
+    strip.append(bar);
+  }
+  card.append(strip);
+
+  const range = document.createElement("div");
+  range.className = "history-range";
+  const successRate = (queryLog.filter(record => record.ok).length / queryLog.length * 100).toFixed(1);
+  const firstTime = document.createElement("span");
+  firstTime.textContent = dateText(queryLog[0].requestedAt);
+  const rate = document.createElement("strong");
+  rate.textContent = "조회 성공률 " + successRate + "% · " + queryLog.length + "건";
+  const latestTime = document.createElement("span");
+  latestTime.textContent = dateText(latest.requestedAt);
+  range.append(firstTime, rate, latestTime);
+  card.append(range);
+
+  const legend = document.createElement("p");
+  legend.className = "meta";
+  legend.textContent = "초록: 자료 제공 · 노랑: 조회 성공, 현장 값 누락 · 빨강: 조회 실패. 기록이 없는 기간의 가동률은 계산하지 않습니다.";
+  card.append(legend, detail);
+  return card;
+}
+
+function queriesContent(id) {
+  const rows = [...queryLog].reverse().map(record => [
+    dateText(record.requestedAt),
+    record.at ? dateText(record.at) : "현재",
+    record.ok ? "성공" : "실패",
+    record.durationMs + "ms",
+    !record.ok ? "확인 불가" : record.available[id] ? "제공" : "누락",
+    record.error || "—"
+  ]);
+  const table = rows.length ? createRecordTable(
+    ["요청 시각", "기준 시각", "조회 결과", "응답시간", "현장 값", "실패 이유"],
+    rows
+  ) : Object.assign(document.createElement("p"), {
+    className: "notice",
+    textContent: "조회 기록이 없습니다."
+  });
+  return [queryStatusHistory(id), table];
+}
+
+async function loadRecords(at, id) {
+  const requestKey = id + "\n" + at;
+  if (recordsLoading || recordsRequestKey === requestKey) return;
+  recordsLoading = true;
+  recordsRequestKey = requestKey;
+  recordsError = "";
+
+  const params = new URLSearchParams({
+    kind: id === "factory" ? "production" : "shipment",
+    at
+  });
+  try {
+    const response = await requestJson(apiUrl(config.apiBaseUrl, "/api/v1/records", params));
+    const problem = validateRecords(response, at);
+    if (problem) throw new Error(problem);
+    recordsData = response;
+    recordsError = "";
+  } catch (error) {
+    recordsError = String(error?.message || error);
+  } finally {
+    recordsLoading = false;
+    renderRecords(lastData, id, true);
+  }
 }
 
 document.querySelector("#record-from").addEventListener("input", event => {
   recordFrom = event.currentTarget.value;
+  checkRecordRange();
 });
 document.querySelector("#record-to").addEventListener("input", event => {
   recordTo = event.currentTarget.value;
+  checkRecordRange();
 });
 document.querySelector("#record-filter").addEventListener("submit", event => {
   event.preventDefault();
+  checkRecordRange();
+  if (!document.querySelector("#record-filter").reportValidity()) return;
   recordFrom = document.querySelector("#record-from").value;
   recordTo = document.querySelector("#record-to").value;
   render();
@@ -719,8 +972,9 @@ function renderGraph(id, label, history) {
 function render(data = lastData) {
   lastData = data;
   renderQueryStatus();
-  document.querySelector("#page-content").setAttribute("aria-busy", String(!data));
+  document.querySelector("#page-content").setAttribute("aria-busy", String(!data && !errorText));
   renderDataError(data, errorText);
+  updateViewControl();
   if (!data) {
     data = emptySnapshot();
     lastData = null;
@@ -734,11 +988,16 @@ function render(data = lastData) {
   const todayView = document.querySelector("#today-view");
   const recordsView = document.querySelector("#records-view");
   const queriesView = document.querySelector("#queries-view");
+  const focusedQueryAt = sameScreen && queriesView.contains(document.activeElement)
+    ? document.activeElement.dataset?.at
+    : "";
+  if (!sameScreen) queryPick = "";
   const backLink = document.querySelector("#back-link");
   const routeNotice = document.querySelector("#route-notice");
-  const issues = currentIssues(data);
+  const issues = currentIssues(data, errorText);
   renderNotifications(issues);
   renderHero(issues);
+  renderQuerySummary();
 
   todayView.hidden = route.view !== "today";
   recordsView.hidden = route.view !== "records";
@@ -754,11 +1013,12 @@ function render(data = lastData) {
   } else if (route.view === "queries") {
     const noun = route.id === "factory" ? "생산" : "출고";
     pageTitle.textContent = noun + " 데이터 조회 기록";
-    pageDescription.textContent = "이 브라우저 탭의 최근 200건입니다. 실제 요청 시각과 조회 대상 시각을 구분합니다.";
-    keepScroll(queriesView, () => queriesView.replaceChildren(Object.assign(document.createElement("p"), {
-      className: "notice",
-      textContent: "조회 기록이 없습니다."
-    })), sameScreen);
+    keepScroll(queriesView, () => queriesView.replaceChildren(...queriesContent(route.id)), sameScreen);
+    if (focusedQueryAt) {
+      queriesView.querySelectorAll(".history-bar").forEach(bar => {
+        if (bar.dataset.at === focusedQueryAt) bar.focus({ preventScroll: true });
+      });
+    }
   } else {
     pageTitle.textContent = "오늘 운영";
     pageDescription.textContent = "생산·출고 실적과 운영 상태를 살펴봅니다.";
@@ -767,6 +1027,57 @@ function render(data = lastData) {
   const viewTime = Date.parse(data.viewTime);
   renderSite("factory", data.sites.factory, viewTime, data.services.alerts);
   renderSite("warehouse", data.sites.warehouse, viewTime, data.services.alerts);
+  const recordsKey = route.view === "records" && lastData ? route.id + "\n" + lastData.viewTime : "";
+  if (recordsKey && !recordsData && !recordsError && !recordsLoading && recordsRequestKey !== recordsKey) {
+    loadRecords(lastData.viewTime, route.id);
+  }
+}
+
+function localDay(value) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date(value));
+}
+
+function localDateTime(value) {
+  return new Date(Date.parse(value) + 9 * HOUR).toISOString().slice(0, 19);
+}
+
+function updateViewControl(rebuild = false) {
+  const select = document.querySelector("#view-time");
+  if (!rebuild && document.activeElement === select) return;
+
+  const now = lastData?.serverTime || new Date().toISOString();
+  const today = localDay(now);
+  const options = [new Option("현재", "")];
+  for (let hour = 0; hour < 24; hour++) {
+    const value = new Date(today + "T" + String(hour).padStart(2, "0") + ":00:00+09:00").toISOString();
+    if (Date.parse(value) > Date.parse(now)) break;
+    options.push(new Option(String(hour).padStart(2, "0") + ":00", value));
+  }
+
+  const latestTime = lastData?.serverTime;
+  for (const value of [latestTime, selectedAt].filter(Boolean)) {
+    if (options.some(option => option.value === value) || localDay(value) !== today || Date.parse(value) > Date.parse(now)) continue;
+    const label = localDateTime(value).slice(11, 16) + (value === latestTime ? " (최근 조회)" : "");
+    options.push(new Option(label, value));
+  }
+
+  select.replaceChildren(...options);
+  select.value = selectedAt;
+}
+
+function changeView(at) {
+  selectedAt = at;
+  viewGeneration++;
+  lastData = null;
+  lastSuccessAt = null;
+  errorText = "";
+  render();
+  if (!polling) poll();
 }
 
 function resolveRoute(hash) {
@@ -791,6 +1102,57 @@ const POLL_INTERVAL_MS = 10000;
 let polling = false;
 let pollTimer = null;
 let nextPollAt = null;
+let queryLog = [];
+let queryPick = "";
+let leaving = false;
+const QUERY_LOG_KEY = "tumble-query-log";
+try {
+  const stored = JSON.parse(sessionStorage.getItem(QUERY_LOG_KEY) || "[]");
+  if (Array.isArray(stored)) {
+    queryLog = stored.filter(record => record && validTime(record.requestedAt) && typeof record.ok === "boolean" &&
+      integer(record.durationMs) && record.available && typeof record.available.factory === "boolean" &&
+      typeof record.available.warehouse === "boolean").slice(-200);
+  }
+} catch {
+  queryLog = [];
+}
+
+function saveQueryLog(entry) {
+  queryLog.push(entry);
+  queryLog = queryLog.slice(-200);
+  try {
+    sessionStorage.setItem(QUERY_LOG_KEY, JSON.stringify(queryLog));
+  } catch {
+    // sessionStorage를 사용할 수 없으면 메모리의 기록만 사용합니다.
+  }
+}
+
+function renderQuerySummary() {
+  const latest = queryLog[queryLog.length - 1];
+  for (const site of ["factory", "warehouse"]) {
+    const value = document.querySelector("#" + site + "-query");
+    const meta = document.querySelector("#" + site + "-query-meta");
+    if (!latest) {
+      value.textContent = "조회 기록 없음";
+      meta.hidden = true;
+      meta.textContent = "";
+      continue;
+    }
+    value.textContent = dateText(latest.requestedAt) + " · " + (latest.ok ? "조회 성공" : "조회 실패");
+    meta.hidden = false;
+    meta.textContent = latest.ok
+      ? "응답시간: " + latest.durationMs + "ms · " + (latest.available[site] ? "현장 값 제공" : "현장 값 누락")
+      : "자료를 받지 못했습니다.";
+  }
+}
+
+function sitesAvailable(data) {
+  return {
+    factory: integer(data.sites.factory.completed) && integer(data.sites.factory.target),
+    warehouse: integer(data.sites.warehouse.completed) && integer(data.sites.warehouse.target)
+  };
+}
+
 const refreshButton = document.querySelector("#refresh-btn");
 const countdownText = document.querySelector("#countdown-text");
 
@@ -802,6 +1164,10 @@ function clearPollSchedule() {
 
 function scheduleNextPoll() {
   clearPollSchedule();
+  if (selectedAt) {
+    updateCountdown();
+    return;
+  }
   nextPollAt = Date.now() + POLL_INTERVAL_MS;
   pollTimer = setTimeout(() => {
     clearPollSchedule();
@@ -811,6 +1177,8 @@ function scheduleNextPoll() {
 }
 
 function updateCountdown() {
+  countdownText.hidden = !!selectedAt;
+  if (selectedAt) return;
   if (polling || !nextPollAt) {
     countdownText.textContent = "조회 중…";
     return;
@@ -830,20 +1198,45 @@ async function poll() {
   if (polling) return;
   clearPollSchedule();
   polling = true;
+  const generation = viewGeneration;
+  const startedAt = Date.now();
+  const entry = {
+    requestedAt: new Date(startedAt).toISOString(),
+    at: selectedAt,
+    ok: false,
+    durationMs: 0,
+    available: { factory: false, warehouse: false },
+    error: ""
+  };
   updateRefreshButton();
   try {
-    const data = await readSnapshot();
+    const data = await readSnapshot(selectedAt);
+    entry.ok = true;
+    entry.available = sitesAvailable(data);
+    if (generation !== viewGeneration) return;
     lastData = data;
     lastSuccessAt = new Date().toISOString();
     errorText = "";
+    recordsData = null;
+    recordsError = "";
+    recordsRequestKey = "";
     render(data);
+    const { view, id } = resolveRoute(location.hash);
+    if (view === "records") loadRecords(data.viewTime, id);
   } catch (error) {
-    errorText = String(error?.message || error);
-    render(lastData);
+    const message = String(error?.message || error);
+    entry.error = message;
+    if (generation === viewGeneration) {
+      if (!leaving) errorText = message;
+      render(lastData);
+    }
   } finally {
+    entry.durationMs = Math.max(0, Date.now() - startedAt);
+    if (entry.ok || !leaving) saveQueryLog(entry);
     polling = false;
     updateRefreshButton();
-    scheduleNextPoll();
+    if (generation !== viewGeneration) poll();
+    else if (!selectedAt) scheduleNextPoll();
   }
 }
 
@@ -860,6 +1253,15 @@ refreshButton.addEventListener("click", () => {
 });
 
 updateRefreshButton();
+document.querySelector("#view-time").addEventListener("change", event => changeView(event.target.value));
+const leaveTimeout = typeof config.timeoutMs === "number" ? config.timeoutMs : 5000;
+for (const eventName of ["beforeunload", "pagehide"]) {
+  window.addEventListener(eventName, () => {
+    leaving = true;
+    setTimeout(() => { leaving = false; }, leaveTimeout);
+  });
+}
+window.addEventListener("pageshow", () => { leaving = false; });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   if (!polling && nextPollAt && Date.now() >= nextPollAt) {
